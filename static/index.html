@@ -1,0 +1,1270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TaPS | ServerNode</title>
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: #1e293b;
+            --border-color: #334155;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --primary: #3b82f6;
+            --success: #22c55e;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            display: flex;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* Layout */
+        .main-area {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+        }
+
+        .sidebar {
+            width: 320px;
+            background-color: var(--card-bg);
+            border-left: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* Header */
+        .header {
+            padding: 0.75rem 1.5rem;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .header h1 { font-size: 1.1rem; font-weight: 600; }
+
+        .mode-toggle {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .mode-btn {
+            padding: 0.4rem 1rem;
+            border: 1px solid var(--border-color);
+            background: transparent;
+            color: var(--text-muted);
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            transition: all 0.2s;
+        }
+
+        .mode-btn.active {
+            background-color: var(--primary);
+            color: white;
+            border-color: var(--primary);
+        }
+
+        /* Viewport */
+        .viewport {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1rem;
+            background-color: #000;
+        }
+
+        .viewport img {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+        }
+
+        .viewport canvas {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            display: block;
+        }
+
+        /* Log overlay - styled like reference playback_server */
+        .log-overlay {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            padding: 0.5rem 1rem;
+            background: linear-gradient(to top, rgba(0, 0, 0, 0.85) 0%, rgba(0, 0, 0, 0.6) 70%, transparent 100%);
+            color: #fff;
+            font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+            font-size: 0.8rem;
+            line-height: 1.4;
+            max-height: 120px;
+            overflow-y: auto;
+            pointer-events: none;
+            display: none;
+            z-index: 10;
+        }
+
+        .log-overlay.visible {
+            display: block;
+        }
+
+        .log-entry {
+            padding: 2px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .log-entry.error {
+            color: #ff6b6b;
+        }
+
+        .log-entry.warning {
+            color: #ffd93d;
+        }
+
+        .log-entry.info {
+            color: #74c0fc;
+        }
+
+        .log-entry .log-time {
+            color: #868e96;
+            margin-right: 0.5rem;
+        }
+
+        .log-entry {
+            padding: 0.25rem 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        /* Controls */
+        .controls {
+            padding: 1rem 1.5rem;
+            border-top: 1px solid var(--border-color);
+            background-color: var(--card-bg);
+        }
+
+        .controls-row {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .controls-row:last-child { margin-bottom: 0; }
+
+        .ctrl-btn {
+            padding: 0.5rem 0.75rem;
+            border: 1px solid var(--border-color);
+            background: transparent;
+            color: var(--text-main);
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            transition: all 0.2s;
+            min-width: 40px;
+        }
+
+        .ctrl-btn:hover { background-color: rgba(255, 255, 255, 0.1); }
+        .ctrl-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        .ctrl-btn.primary {
+            background-color: var(--primary);
+            border-color: var(--primary);
+            color: white;
+        }
+
+        .ctrl-btn.danger {
+            background-color: var(--danger);
+            border-color: var(--danger);
+            color: white;
+        }
+
+        .ctrl-btn.success {
+            background-color: var(--success);
+            border-color: var(--success);
+            color: white;
+        }
+
+        .time-display {
+            font-family: monospace;
+            font-size: 0.9rem;
+            color: var(--text-primary);
+            min-width: 100px;
+            text-align: center;
+        }
+
+        .frame-display {
+            font-family: monospace;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+        }
+
+        .speed-display {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            min-width: 50px;
+            text-align: center;
+        }
+
+        /* Marker dialog */
+        .marker-dialog {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        .marker-dialog-content {
+            background: var(--bg-primary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 1.5rem;
+            min-width: 350px;
+            max-width: 500px;
+        }
+
+        .marker-row {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-bottom: 0.75rem;
+        }
+
+        .marker-row label {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            min-width: 80px;
+        }
+
+        .marker-type-buttons {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .marker-type-btn {
+            padding: 0.25rem 0.75rem;
+            font-size: 0.8rem;
+        }
+
+        .marker-type-btn.active {
+            background: var(--accent);
+            color: var(--text-primary);
+        }
+
+        .marker-type-btn[data-type="START"].active {
+            background: #22c55e;
+        }
+
+        .marker-type-btn[data-type="END"].active {
+            background: #ef4444;
+        }
+
+        .marker-type-btn[data-type="NOTE"].active {
+            background: #3b82f6;
+        }
+
+        #marker-text {
+            width: 100%;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 0.5rem;
+            border-radius: 4px;
+            font-family: inherit;
+            font-size: 0.85rem;
+            resize: vertical;
+        }
+
+        input[type="range"] {
+            flex: 1;
+            height: 4px;
+            -webkit-appearance: none;
+            background: var(--border-color);
+            border-radius: 2px;
+            outline: none;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 14px;
+            height: 14px;
+            background: var(--primary);
+            border-radius: 50%;
+            cursor: pointer;
+        }
+
+        select, input[type="number"] {
+            padding: 0.4rem;
+            background: var(--bg-color);
+            border: 1px solid var(--border-color);
+            color: var(--text-main);
+            border-radius: 4px;
+            font-size: 0.85rem;
+        }
+
+        /* Sidebar */
+        .sidebar-header {
+            padding: 1rem;
+            border-bottom: 1px solid var(--border-color);
+            font-weight: 600;
+            font-size: 0.9rem;
+        }
+
+        .sidebar-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 0.5rem;
+        }
+
+        .session-item {
+            padding: 0.75rem;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            margin-bottom: 0.5rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .session-item:hover {
+            border-color: var(--primary);
+            background-color: rgba(59, 130, 246, 0.1);
+        }
+
+        .session-item.active {
+            border-color: var(--primary);
+            background-color: rgba(59, 130, 246, 0.15);
+        }
+
+        .session-name { font-weight: 500; font-size: 0.9rem; }
+        .session-meta { font-size: 0.75rem; color: var(--text-muted); margin-top: 0.25rem; }
+
+        .camera-status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .camera-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: var(--text-muted);
+        }
+
+        .camera-dot.online { background-color: var(--success); }
+        .camera-dot.offline { background-color: var(--danger); }
+
+        .camera-name { font-size: 0.85rem; }
+        .camera-info { font-size: 0.75rem; color: var(--text-muted); }
+
+        /* Status badge */
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.25rem 0.6rem;
+            border-radius: 9999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            border: 1px solid var(--border-color);
+        }
+
+        .status-badge.recording {
+            background: rgba(239, 68, 68, 0.15);
+            color: var(--danger);
+            border-color: rgba(239, 68, 68, 0.3);
+        }
+
+        .status-badge-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+
+        .recording .status-badge-dot { animation: pulse 1.5s infinite; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+
+        /* Controls - always visible */
+        .controls {
+            /* No hiding - always shown */
+        }
+    </style>
+</head>
+<body>
+    <div class="main-area">
+        <!-- Header -->
+        <div class="header">
+            <h1>TaPS ServerNode</h1>
+            <div style="display: flex; align-items: center; gap: 1rem;">
+                <span id="status-badge" class="status-badge">
+                    <span class="status-badge-dot"></span>
+                    <span id="status-text">IDLE</span>
+                </span>
+                <div class="mode-toggle">
+                    <button class="mode-btn active" onclick="app.setMode('realtime')">Live</button>
+                    <button class="mode-btn" onclick="app.setMode('playback')">Playback</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Viewport -->
+        <div class="viewport" style="position: relative;">
+            <img id="live-stream" src="" alt="Live Stream" style="display: none;">
+            <canvas id="playback-canvas" style="display: none;"></canvas>
+            <div id="log-overlay" class="log-overlay"></div>
+        </div>
+
+        <!-- Controls -->
+        <div class="controls">
+            <!-- Playback controls (always visible when session is loaded) -->
+            <div id="playback-controls">
+                <div class="controls-row">
+                    <button class="ctrl-btn" onclick="app.stepBackward()" title="Step backward one frame">⏪</button>
+                    <button class="ctrl-btn primary" id="btn-play" onclick="app.togglePlay()" disabled>▶ Play</button>
+                    <button class="ctrl-btn" onclick="app.stepForward()" title="Step forward one frame">⏩</button>
+                    <button class="ctrl-btn" onclick="app.stopPlayback()" title="Stop and reset">⏹</button>
+                    <span class="time-display" id="time-display">00:00:00.000</span>
+                    <span class="frame-display" id="frame-display" style="font-size: 0.85rem; color: var(--text-muted); margin-left: 0.5rem;">Frame: 0</span>
+                    <button class="ctrl-btn" onclick="app.seekTo(5)" title="Seek forward 5s">⏩+5</button>
+                    <button class="ctrl-btn" onclick="app.seekTo(-5)" title="Seek backward 5s">⏩-5</button>
+                </div>
+                <div class="controls-row">
+                    <span style="font-size: 0.75rem; color: var(--text-muted);">Playback:</span>
+                    <button class="ctrl-btn" onclick="app.setPlaybackSpeed(0.05)" disabled>0.05x</button>
+                    <button class="ctrl-btn" onclick="app.setPlaybackSpeed(0.25)" disabled>0.25x</button>
+                    <button class="ctrl-btn" onclick="app.setPlaybackSpeed(0.5)" disabled>0.5x</button>
+                    <button class="ctrl-btn" onclick="app.setPlaybackSpeed(1)" disabled>1x</button>
+                    <button class="ctrl-btn" onclick="app.setPlaybackSpeed(2)" disabled>2x</button>
+                    <button class="ctrl-btn" onclick="app.setPlaybackSpeed(4)" disabled>4x</button>
+                    <span class="speed-display" id="speed-display">1.0x</span>
+                    <input type="range" id="seek-slider" min="0" max="100" value="0" style="flex: 2;" disabled
+                           oninput="app.seekToBySlider(this.value)">
+                    <span style="flex:1"></span>
+                    <button class="ctrl-btn" id="btn-log-toggle" onclick="app.toggleLogOverlay()" disabled>📋 Logs</button>
+                    <button class="ctrl-btn" id="btn-marker" onclick="app.showMarkerDialog()" disabled>📌 Marker</button>
+                    <span style="font-size: 0.75rem; color: var(--text-muted);">Rotate:</span>
+                    <select id="rotate-stream" onchange="app.setRotateStream(this.value)" disabled>
+                        <option value="0">Camera 1</option>
+                        <option value="1">Camera 2</option>
+                        <option value="2">Camera 3</option>
+                        <option value="3">Camera 4</option>
+                    </select>
+                    <button class="ctrl-btn" onclick="app.rotateStream(0)" disabled>0°</button>
+                    <button class="ctrl-btn" onclick="app.rotateStream(90)" disabled>90°</button>
+                    <button class="ctrl-btn" onclick="app.rotateStream(180)" disabled>180°</button>
+                    <button class="ctrl-btn" onclick="app.rotateStream(270)" disabled>270°</button>
+                </div>
+            </div>
+
+            <!-- Recording controls (visible in live mode, disabled in playback mode) -->
+            <div id="recording-controls" style="display: none;">
+                <div class="controls-row">
+                    <button class="ctrl-btn success" id="btn-record-start" onclick="app.startRecording()">
+                        ● Start Recording
+                    </button>
+                    <button class="ctrl-btn danger" id="btn-record-stop" onclick="app.stopRecording()" disabled>
+                        ■ Stop Recording
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Sidebar -->
+    <div class="sidebar">
+        <div class="sidebar-header">Cameras</div>
+        <div id="camera-status" class="sidebar-content"></div>
+
+        <div class="sidebar-header">Recordings</div>
+        <div id="session-list" class="sidebar-content">
+            <button class="ctrl-btn" onclick="app.refreshSessions()" style="width: 100%;">Refresh</button>
+        </div>
+    </div>
+
+    <script>
+    class TaPSApp {
+        constructor() {
+            this.mode = 'realtime';
+            this.sessionId = null;
+            this.sessionLoaded = false;
+            this._localPlaying = false;
+            this.playbackState = { playing: false, time: 0, speed: 1.0, frame: 0 };
+            this.markers = [];
+            this.selectedMarkerType = 'NOTE';
+            this.currentRotation = [0, 0, 0, 0];
+            this.selectedStreamForRotation = 0;
+            this.liveInterval = null;
+            this.playbackInterval = null;
+            this._lastFrameTime = 0;
+            this._processingFrame = false;
+            this.ws = null;
+            this.connectWebSocket();
+            this.refreshCameras();
+            this.refreshSessions();
+        }
+
+        setMode(mode) {
+            this.mode = mode;
+            document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+            event.target.classList.add('active');
+
+            const liveImg = document.getElementById('live-stream');
+            const canvas = document.getElementById('playback-canvas');
+            const playbackCtrl = document.getElementById('playback-controls');
+            const recordCtrl = document.getElementById('recording-controls');
+            const logOverlay = document.getElementById('log-overlay');
+
+            if (mode === 'realtime') {
+                liveImg.style.display = 'block';
+                canvas.style.display = 'none';
+                playbackCtrl.style.display = 'none';
+                recordCtrl.style.display = 'block';
+                logOverlay.classList.remove('visible');
+                this.startLiveStream();
+                this.stopPlayback();
+            } else {
+                liveImg.style.display = 'none';
+                canvas.style.display = 'block';
+                playbackCtrl.style.display = 'block';
+                recordCtrl.style.display = 'none';
+                this.stopLiveStream();
+            }
+        }
+
+        // --- Live Stream ---
+        startLiveStream() {
+            const img = document.getElementById('live-stream');
+            img.src = '/api/grid/stream';
+        }
+
+        stopLiveStream() {
+            const img = document.getElementById('live-stream');
+            img.src = '';
+        }
+
+        // --- Camera Status ---
+        async refreshCameras() {
+            try {
+                const res = await fetch('/api/cameras');
+                const data = await res.json();
+                this.renderCameraStatus(data.cameras);
+            } catch (e) {
+                console.error('Failed to fetch cameras:', e);
+            }
+        }
+
+        renderCameraStatus(cameras) {
+            const container = document.getElementById('camera-status');
+            container.innerHTML = cameras.map(c => `
+                <div class="camera-status">
+                    <span class="camera-dot ${c.connected ? 'online' : 'offline'}"></span>
+                    <div>
+                        <div class="camera-name">${c.name}</div>
+                        <div class="camera-info">${c.host} · ${c.frame_count} frames</div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // --- Sessions ---
+        async refreshSessions() {
+            try {
+                const res = await fetch('/api/sessions');
+                const data = await res.json();
+                this.renderSessionList(data.sessions);
+            } catch (e) {
+                console.error('Failed to fetch sessions:', e);
+            }
+        }
+
+        renderSessionList(sessions) {
+            const container = document.getElementById('session-list');
+            if (!sessions || sessions.length === 0) {
+                container.innerHTML = '<p style="color: var(--text-muted); font-size: 0.85rem; padding: 0.5rem;">No recordings found</p>';
+                return;
+            }
+            container.innerHTML = sessions.map(s => `
+                <div class="session-item ${s.id === this.sessionId ? 'active' : ''}" onclick="app.loadSession('${s.id}')">
+                    <div class="session-name">${s.id}</div>
+                    <div class="session-meta">${s.camera_count || '?'} cameras · ${s.status || 'unknown'}</div>
+                </div>
+            `).join('');
+        }
+
+        async loadSession(sessionId) {
+            // Keep session list visible — just mark this one as active
+            this.sessionId = sessionId;
+            this.sessionLoaded = false;
+
+            console.log('Loading session:', sessionId);
+
+            // Load via WebSocket
+            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                this.ws.send(JSON.stringify({
+                    action: 'load_session',
+                    session_id: sessionId
+                }));
+            } else {
+                console.warn('WebSocket not connected, trying direct API');
+            }
+
+            // Also try direct API as fallback
+            try {
+                const res = await fetch(`/api/session/${sessionId}/metadata`);
+                const data = await res.json();
+                // Check all_files (new format) or taps_files (legacy)
+                const files = data.all_files || data.taps_files || [];
+                if (files.length > 0) {
+                    console.log('Session loaded via API:', files.length, 'files');
+                    this.sessionLoaded = true;
+                    this.enablePlaybackControls(true);
+                    // Load markers for this session
+                    this.loadMarkers();
+                } else {
+                    console.warn('Session has no video files via API');
+                    this.enablePlaybackControls(false);
+                }
+            } catch (e) {
+                console.error('Failed to load session via API:', e);
+                this.enablePlaybackControls(false);
+            }
+        }
+
+        // --- Playback ---
+        async togglePlay() {
+            if (!this.sessionId) {
+                alert('Please select a session first.');
+                return;
+            }
+            // Use local playing state, not WebSocket-updated state
+            if (!this._localPlaying) {
+                await this.play();
+            } else {
+                await this.pause();
+            }
+        }
+
+        async play() {
+            if (!this.sessionId) {
+                alert('No session loaded.');
+                return;
+            }
+            try {
+                const res = await fetch('/api/session/' + this.sessionId + '/play', { method: 'POST' });
+                const data = await res.json();
+                this._localPlaying = true;
+                this.playbackState.playing = true;
+                document.getElementById('btn-play').textContent = '⏸ Pause';
+                document.getElementById('btn-play').classList.remove('primary');
+                document.getElementById('btn-play').classList.add('success');
+                console.log('Playback started:', data);
+                this.startPlaybackLoop();
+            } catch (e) {
+                console.error('Play failed:', e);
+            }
+        }
+
+        async pause() {
+            if (!this.sessionId) return;
+            try {
+                await fetch('/api/session/' + this.sessionId + '/pause', { method: 'POST' });
+                this._localPlaying = false;
+                this.playbackState.playing = false;
+                document.getElementById('btn-play').textContent = '▶ Play';
+                document.getElementById('btn-play').classList.add('primary');
+                document.getElementById('btn-play').classList.remove('success');
+                this.stopPlaybackLoop();
+            } catch (e) {
+                console.error('Pause failed:', e);
+            }
+        }
+
+        async stepForward() {
+            try {
+                const res = await fetch('/api/session/' + this.sessionId + '/step', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ direction: 'forward' })
+                });
+                const data = await res.json();
+                console.log('Step forward:', data);
+                // Don't call renderFrame() — backend already stepped, just fetch current frame
+                this.renderCurrentFrame();
+            } catch (e) {
+                console.error('Step failed:', e);
+            }
+        }
+
+        async stepBackward() {
+            try {
+                const res = await fetch('/api/session/' + this.sessionId + '/step', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ direction: 'backward' })
+                });
+                const data = await res.json();
+                console.log('Step backward:', data);
+                // Don't call renderFrame() — backend already stepped, just fetch current frame
+                this.renderCurrentFrame();
+            } catch (e) {
+                console.error('Step failed:', e);
+            }
+        }
+
+        async renderCurrentFrame() {
+            // Fetch current frame WITHOUT stepping (unlike renderFrame which steps)
+            const canvas = document.getElementById('playback-canvas');
+            const ctx = canvas.getContext('2d');
+
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 3000);
+                const res = await fetch('/api/session/' + this.sessionId + '/current-frame?quality=60', {
+                    signal: controller.signal
+                });
+                clearTimeout(timeoutId);
+
+                if (!res.ok) {
+                    console.warn('Current frame fetch failed:', res.status, res.statusText);
+                    return;
+                }
+
+                const blob = await res.blob();
+                const img = await createImageBitmap(blob);
+                const rect = canvas.getBoundingClientRect();
+                canvas.width = Math.round(rect.width);
+                canvas.height = Math.round(rect.height);
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                this.drawMarkerIndicators(ctx, canvas.width, canvas.height);
+            } catch (e) {
+                console.error('Render current frame failed:', e);
+            }
+        }
+
+        async stopPlayback() {
+            try {
+                await fetch('/api/session/' + this.sessionId + '/pause', { method: 'POST' });
+                this.playbackState.playing = false;
+                this.playbackState.time = 0;
+                this.playbackState.frame = 0;
+                document.getElementById('btn-play').textContent = '▶ Play';
+                document.getElementById('btn-play').classList.add('primary');
+                document.getElementById('btn-play').classList.remove('success');
+                this.stopPlaybackLoop();
+                this.updateTimeDisplay();
+            } catch (e) {
+                console.error('Stop failed:', e);
+            }
+        }
+
+        async seekToBySlider(value) {
+            if (!this.sessionId) return;
+            const totalFrames = this.playbackEngine._streams[0] ? this.playbackEngine.get_total_frames() : 1;
+            const frame = Math.floor((value / 100) * totalFrames);
+            const seconds = frame / 30; // approximate
+            await this.seekToTime(seconds);
+            document.getElementById('seek-slider').value = value;
+        }
+
+        async seekTo(delta) {
+            const current = this.playbackState.time;
+            const target = Math.max(0, current + delta);
+            await this.seekToTime(target);
+        }
+
+        async seekToTime(seconds) {
+            try {
+                await fetch('/api/session/' + this.sessionId + '/seek', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ time: seconds })
+                });
+                this.renderFrame();
+            } catch (e) {
+                console.error('Seek failed:', e);
+            }
+        }
+
+        async setPlaybackSpeed(speed) {
+            try {
+                await fetch('/api/session/' + this.sessionId + '/speed', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ speed })
+                });
+                this.playbackState.speed = speed;
+                document.getElementById('speed-display').textContent = speed.toFixed(1) + 'x';
+                console.log(`Speed updated: playbackState.speed=${this.playbackState.speed} (should be ${speed})`);
+            } catch (e) {
+                console.error('Speed change failed:', e);
+            }
+        }
+
+        setRotateStream(index) {
+            this.selectedStreamForRotation = parseInt(index);
+        }
+
+        async rotateStream(degrees) {
+            try {
+                await fetch('/api/session/' + this.sessionId + '/rotate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        stream: this.selectedStreamForRotation,
+                        degrees
+                    })
+                });
+                this.currentRotation[this.selectedStreamForRotation] = degrees;
+            } catch (e) {
+                console.error('Rotation failed:', e);
+            }
+        }
+
+        startPlaybackLoop() {
+            if (this.playbackInterval) return;
+            this._lastFrameTime = 0;
+            this._processingFrame = false;
+            this.playbackInterval = true;
+            this._runPlaybackFrame();
+        }
+
+        _runPlaybackFrame() {
+            if (!this.playbackInterval || !this.playbackState.playing) {
+                this.playbackInterval = null;
+                return;
+            }
+
+            const now = performance.now();
+            // Speed controls the frame interval: 1x = 33ms, 0.5x = 66ms, 2x = 16ms
+            const speed = this.playbackState.speed || 1.0;
+            const frameInterval = 33 / speed;
+
+            if (now - this._lastFrameTime >= frameInterval && !this._processingFrame) {
+                this._processingFrame = true;
+                this._lastFrameTime = now;
+
+                // Debug: log speed on every frame render
+                console.log(`[RENDER] speed=${speed}x, interval=${frameInterval.toFixed(1)}ms, frame=${this.playbackState.frame}`);
+
+                this.renderFrame().then(() => {
+                    this._processingFrame = false;
+                }).catch(() => {
+                    this._processingFrame = false;
+                });
+            }
+
+            requestAnimationFrame(() => this._runPlaybackFrame());
+        }
+
+        stopPlaybackLoop() {
+            this.playbackInterval = null;
+            this._processingFrame = false;
+        }
+
+        async renderFrame() {
+            const canvas = document.getElementById('playback-canvas');
+            const ctx = canvas.getContext('2d');
+
+            try {
+                // Add timeout to prevent blocking on slow networks
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 3000);
+
+                const res = await fetch('/api/session/' + this.sessionId + '/frame?quality=60', {
+                    signal: controller.signal
+                });
+                clearTimeout(timeoutId);
+
+                if (!res.ok) {
+                    console.warn('Frame fetch failed:', res.status, res.statusText);
+                    return;
+                }
+
+                const blob = await res.blob();
+                const img = await createImageBitmap(blob);
+
+                // Set canvas to display size, not full image resolution
+                const rect = canvas.getBoundingClientRect();
+                canvas.width = Math.round(rect.width);
+                canvas.height = Math.round(rect.height);
+
+                // Draw image scaled to fit
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+                // Draw marker indicators
+                this.drawMarkerIndicators(ctx, canvas.width, canvas.height);
+
+                // Get time/frame from WebSocket state_update, don't track locally
+                // Only update log overlay periodically
+                if (this.playbackState.frame % 5 === 0) {
+                    this.updateLogOverlay();
+                }
+
+            } catch (e) {
+                if (e.name !== 'AbortError') {
+                    console.error('Frame render failed:', e);
+                }
+            }
+        }
+
+        drawMarkerIndicators(ctx, width, height) {
+            const currentFrame = this.playbackState.frame;
+            const nearThreshold = 10; // frames
+
+            this.markers.forEach(marker => {
+                const dist = Math.abs(marker.frame - currentFrame);
+                if (dist <= nearThreshold) {
+                    // Draw marker indicator
+                    let color;
+                    switch (marker.type) {
+                        case 'START': color = '#22c55e'; break;
+                        case 'END': color = '#ef4444'; break;
+                        case 'NOTE': color = '#3b82f6'; break;
+                        default: color = '#888';
+                    }
+
+                    // Draw colored bar at top
+                    ctx.fillStyle = color;
+                    ctx.fillRect(0, 0, width, 4);
+
+                    // Draw marker label
+                    ctx.fillStyle = color;
+                    ctx.font = 'bold 14px monospace';
+                    ctx.fillText(`${marker.type} Frame ${marker.frame}`, 10, 24);
+
+                    // Draw text if close
+                    if (dist <= 2) {
+                        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+                        ctx.fillRect(0, height - 60, width, 60);
+                        ctx.fillStyle = '#fff';
+                        ctx.font = 'bold 13px monospace';
+                        const header = `Frame ${marker.frame}:`;
+                        ctx.fillText(header, 10, height - 44);
+                        ctx.font = '12px monospace';
+                        const lines = marker.text ? marker.text.split('\n') : [];
+                        lines.forEach((line, i) => {
+                            ctx.fillText(line, 10, height - 26 + (i * 16));
+                        });
+                    }
+                }
+            });
+        }
+
+        async updateLogOverlay() {
+            try {
+                const res = await fetch('/api/session/' + this.sessionId + '/logs');
+                const data = await res.json();
+                const overlay = document.getElementById('log-overlay');
+                // Debug: log what we receive
+                if (data.logs && data.logs.length > 0) {
+                    console.log(`Log overlay: ${data.logs.length} entries at time ${data.time?.toFixed(2)}s`);
+                    overlay.innerHTML = data.logs.map(l => {
+                        let className = 'info';
+                        let displayText = l;
+                        const lower = l.toLowerCase();
+                        if (lower.includes('error') || lower.includes('exception')) {
+                            className = 'error';
+                        } else if (lower.includes('warn')) {
+                            className = 'warning';
+                        }
+                        const timeMatch = l.match(/\[?([\d:]+\.\d+|[\d:]+)\]?/);
+                        if (timeMatch) {
+                            displayText = `<span class="log-time">${timeMatch[1]}</span> ${l.substring(timeMatch.index + timeMatch[0].length)}`;
+                        }
+                        return `<div class="log-entry ${className}">${displayText}</div>`;
+                    }).join('');
+                    overlay.classList.add('visible');
+                } else {
+                    overlay.classList.remove('visible');
+                    console.log(`Log overlay: no entries at time ${data.time?.toFixed(2)}s`);
+                }
+            } catch (e) {
+                console.error('Log fetch failed:', e);
+            }
+        }
+
+        stopPlayback() {
+            this.stopPlaybackLoop();
+            this.playbackState.playing = false;
+            this.playbackState.time = 0;
+            this.playbackState.frame = 0;
+            document.getElementById('btn-play').textContent = '▶ Play';
+            document.getElementById('btn-play').classList.add('primary');
+            document.getElementById('btn-play').classList.remove('success');
+        }
+
+        toggleLogOverlay() {
+            const overlay = document.getElementById('log-overlay');
+            overlay.classList.toggle('visible');
+            const btn = document.getElementById('btn-log-toggle');
+            if (overlay.classList.contains('visible')) {
+                btn.classList.add('success');
+                btn.textContent = '📋 Logs ✓';
+            } else {
+                btn.classList.remove('success');
+                btn.textContent = '📋 Logs';
+            }
+        }
+
+        // --- Marker Dialog ---
+        showMarkerDialog() {
+            if (!this.sessionId) {
+                alert('No session loaded.');
+                return;
+            }
+
+            // Pause playback
+            if (this.playbackState.playing) {
+                this.pause();
+            }
+
+            // Set dialog values
+            document.getElementById('marker-frame').textContent = this.playbackState.frame;
+            document.getElementById('marker-time').textContent = this.playbackState.time.toFixed(2) + 's';
+            document.getElementById('marker-text').value = '';
+
+            // Reset marker type to NOTE
+            this.selectedMarkerType = 'NOTE';
+            this.updateMarkerTypeButtons();
+
+            // Show dialog
+            document.getElementById('marker-dialog').style.display = 'flex';
+            document.getElementById('marker-text').focus();
+        }
+
+        closeMarkerDialog() {
+            document.getElementById('marker-dialog').style.display = 'none';
+        }
+
+        selectMarkerType(type) {
+            this.selectedMarkerType = type;
+            this.updateMarkerTypeButtons();
+        }
+
+        updateMarkerTypeButtons() {
+            document.querySelectorAll('.marker-type-btn').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.type === this.selectedMarkerType);
+            });
+        }
+
+        async saveMarker() {
+            const text = document.getElementById('marker-text').value.trim();
+            const frame = this.playbackState.frame;
+            const time = this.playbackState.time;
+            const type = this.selectedMarkerType;
+
+            try {
+                const res = await fetch('/api/session/' + this.sessionId + '/markers', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ frame, time, type, text })
+                });
+                const data = await res.json();
+                if (data.status === 'ok') {
+                    console.log('Marker saved:', type, 'at frame', frame);
+                    this.closeMarkerDialog();
+                    // Reload markers for display
+                    this.loadMarkers();
+                } else {
+                    console.error('Failed to save marker:', data.error);
+                }
+            } catch (e) {
+                console.error('Save marker failed:', e);
+            }
+        }
+
+        async loadMarkers() {
+            try {
+                const res = await fetch('/api/session/' + this.sessionId + '/markers');
+                const data = await res.json();
+                this.markers = data.markers || [];
+                console.log('Loaded', this.markers.length, 'markers');
+            } catch (e) {
+                console.error('Load markers failed:', e);
+            }
+        }
+
+        // --- Recording ---
+        async startRecording() {
+            try {
+                await fetch('/recording', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'start' })
+                });
+                this.updateRecordingUI(true);
+            } catch (e) {
+                console.error('Start recording failed:', e);
+            }
+        }
+
+        async stopRecording() {
+            try {
+                await fetch('/recording', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'stop' })
+                });
+                this.updateRecordingUI(false);
+            } catch (e) {
+                console.error('Stop recording failed:', e);
+            }
+        }
+
+        updateRecordingUI(recording) {
+            document.getElementById('btn-record-start').disabled = recording;
+            document.getElementById('btn-record-stop').disabled = !recording;
+
+            const badge = document.getElementById('status-badge');
+            const text = document.getElementById('status-text');
+            if (recording) {
+                badge.classList.add('recording');
+                text.textContent = 'RECORDING';
+            } else {
+                badge.classList.remove('recording');
+                text.textContent = 'IDLE';
+            }
+        }
+
+        // --- Utilities ---
+        enablePlaybackControls(enabled) {
+            const controls = document.getElementById('playback-controls');
+            if (!controls) {
+                console.error('playback-controls element not found!');
+                return;
+            }
+
+            const btns = controls.querySelectorAll('button');
+            const selects = controls.querySelectorAll('select');
+            const sliders = controls.querySelectorAll('input[type="range"]');
+
+            btns.forEach(btn => btn.disabled = !enabled);
+            selects.forEach(sel => sel.disabled = !enabled);
+            sliders.forEach(slider => slider.disabled = !enabled);
+
+            console.log('Playback controls', enabled ? 'ENABLED' : 'DISABLED');
+        }
+
+        updateTimeDisplay() {
+            const t = this.playbackState.time;
+            const h = Math.floor(t / 3600);
+            const m = Math.floor((t % 3600) / 60);
+            const s = Math.floor(t % 60);
+            const ms = Math.floor((t % 1) * 1000);
+            document.getElementById('time-display').textContent =
+                `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(ms).padStart(3, '0')}`;
+            // Update frame counter (from video #1)
+            const frame = this.playbackState.frame;
+            document.getElementById('frame-display').textContent = `Frame: ${frame}`;
+        }
+
+        connectWebSocket() {
+            const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            this.ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+            this.ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    if (data.type === 'state_update') {
+                        this.playbackState.time = data.time;
+                        this.playbackState.frame = data.frame;
+                        this.playbackState.speed = data.speed !== undefined ? data.speed : this.playbackState.speed;
+                        this.updateTimeDisplay();
+
+                        if (data.cameras) {
+                            this.renderCameraStatus(data.cameras);
+                        }
+                    } else if (data.type === 'session_loaded') {
+                        console.log('Session loaded via WebSocket:', data.session_id, data.files + ' files');
+                        this.sessionId = data.session_id;
+                        this.sessionLoaded = true;
+                        // Enable playback controls (already done by API fallback, but just in case)
+                        this.enablePlaybackControls(true);
+                    } else if (data.type === 'session_error') {
+                        console.error('Session load error:', data.error);
+                        this.sessionLoaded = false;
+                        this.enablePlaybackControls(false);
+                        alert('Failed to load session: ' + data.error);
+                    }
+                } catch (e) {
+                    console.error('WS message parse error:', e);
+                }
+            };
+
+            this.ws.onerror = (e) => console.error('WebSocket error:', e);
+            this.ws.onclose = () => {
+                console.log('WebSocket closed, reconnecting...');
+                setTimeout(() => this.connectWebSocket(), 2000);
+            };
+        }
+    }
+
+    // Initialize app
+    const app = new TaPSApp();
+    </script>
+
+    <!-- Marker Dialog Modal -->
+    <div id="marker-dialog" class="marker-dialog" style="display: none;">
+        <div class="marker-dialog-content">
+            <h3 style="margin: 0 0 1rem 0; color: var(--text-primary);">Add Marker</h3>
+            <div class="marker-row">
+                <label>Frame:</label>
+                <span id="marker-frame" style="color: var(--text-muted);">-</span>
+            </div>
+            <div class="marker-row">
+                <label>Time:</label>
+                <span id="marker-time" style="color: var(--text-muted);">-</span>
+            </div>
+            <div class="marker-row">
+                <label>Marker Type:</label>
+                <div class="marker-type-buttons">
+                    <button class="ctrl-btn marker-type-btn" data-type="START" onclick="app.selectMarkerType('START')">START</button>
+                    <button class="ctrl-btn marker-type-btn" data-type="END" onclick="app.selectMarkerType('END')">END</button>
+                    <button class="ctrl-btn marker-type-btn active" data-type="NOTE" onclick="app.selectMarkerType('NOTE')">NOTE</button>
+                </div>
+            </div>
+            <div class="marker-row">
+                <label>Text:</label>
+                <textarea id="marker-text" placeholder="Enter marker text..." rows="3"></textarea>
+            </div>
+            <div class="marker-row" style="justify-content: flex-end; gap: 0.5rem;">
+                <button class="ctrl-btn" onclick="app.closeMarkerDialog()">Cancel</button>
+                <button class="ctrl-btn primary" onclick="app.saveMarker()">Save</button>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
