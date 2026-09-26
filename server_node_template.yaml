@@ -1,0 +1,34 @@
+# TaPS ServerNode Configuration Template
+# Copy this file to server_node.yaml and edit for your setup.
+
+cameras:
+  - name: "CameraNode1"
+    host: "10.0.1.11"
+    http_port: 8080
+  - name: "CameraNode2"
+    host: "10.0.1.12"
+    http_port: 8080
+  - name: "CameraNode3"
+    host: "10.0.1.13"
+    http_port: 8080
+  - name: "CameraNode4"
+    host: "10.0.1.14"
+    http_port: 8080
+
+network_tables:
+  server: "10.0.1.X"    # RoboRIO NetworkTables IP address
+  match_start_topic: "RoboRIO/matchStart"
+  match_end_topic: "RoboRIO/matchEnd"
+
+smb_share:
+  path: "\\\\10.0.2.X\\share\\logs"  # Robot Control PC SMB share
+  username: ""                # Leave empty for anonymous/guest access
+  password: ""                # Leave empty if not needed
+  poll_interval: 30           # Seconds between SMB share checks
+
+recording:
+  output_dir: "/recordings"   # Local path for recorded .taps files
+
+web:
+  host: "0.0.0.0"             # Bind address
+  port: 8080                  # HTTP server port
