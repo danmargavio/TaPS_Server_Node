@@ -1,4 +1,5 @@
 opencv-python>=4.8
+numpy>=1.24
 aiohttp>=3.9
 pyyaml>=6.0
 smbprotocol>=1.10

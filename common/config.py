@@ -216,6 +216,10 @@ class ServerNodeConfig:
     web_host: str = "0.0.0.0"
     web_port: int = 8080
 
+    # Pose fusion (optional): the raw 'fusion' YAML section, kept verbatim.
+    # See shared_config/fusion_example.yaml for the schema; empty = fusion disabled.
+    fusion: dict = field(default_factory=dict)
+
     @classmethod
     def from_yaml(cls, path: str) -> 'ServerNodeConfig':
         """Load configuration from a YAML file."""
@@ -252,6 +256,7 @@ class ServerNodeConfig:
             output_dir=data.get('recording', {}).get('output_dir', cls.output_dir),
             web_host=web.get('host', cls.web_host),
             web_port=web.get('port', cls.web_port),
+            fusion=data.get('fusion') or {},
         )
 
     def to_dict(self) -> dict:
@@ -279,6 +284,7 @@ class ServerNodeConfig:
                 'host': self.web_host,
                 'port': self.web_port,
             },
+            'fusion': self.fusion,
         }
 
     def get_camera_by_index(self, index: int) -> Optional[CameraConfig]:

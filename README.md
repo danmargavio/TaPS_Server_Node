@@ -137,11 +137,16 @@ python main.py server_node.yaml
 
 ## .taps File Format
 
-The `.taps` binary format stores video frames with PTP timestamps:
+Full specification: [`../common/taps_format.md`](../common/taps_format.md)
+
+The `.taps` binary format stores video frames with GPS-aligned nanosecond
+timestamps (PPS + chrony discipline; PTP optional). Version `0x02` is the
+baseline; version `0x03` adds per-frame AprilTag detections (id, pose, and
+quality/uncertainty metrics for fusion) plus camera intrinsics in the header.
 
 ```
 Header:
-  Magic:     'TaPS\x02' (5 bytes)
+  Magic:     'TaPS\x02' or 'TaPS\x03' (5 bytes)
   Encoder:   uint8 (0=JPEG, 1=RAW)
   Width:     uint64
   Height:    uint64
@@ -149,12 +154,16 @@ Header:
   ArgsLen:   uint32
   Args:      string (variable length)
   FrameCount:uint64
+  [0x03 only] Fx,Fy,Cx,Cy: 4×double (intrinsics) · TagSizeM: double
+            · CameraAlias: u32+string · TagFamily: u32+string
 
 Frame (repeated):
   FrameIdx:  uint64
-  PTP_Ns:    int64
+  PTP_Ns:    int64        (GPS-aligned nanoseconds; see spec)
   Size:      uint32
+  [0x03 only] MetaSize:   uint32
   Data:      bytes (variable length)
+  [0x03 only] Meta:       bytes (AprilTag records; see spec)
 ```
 
 ## Web Frontend
@@ -235,6 +244,10 @@ web:
 | `/recording` | POST | Start/stop recording (`{"action": "start/stop"}`) |
 | `/events` | GET | SSE events (status, disk, cpu, mem) |
 | `/files/` | GET | Browse recorded files |
+| `/calibrate` | GET | Guided calibration wizard (focus test + capture + save) |
+| `/calib/status` | GET | Calibration state / focus score / coverage JSON |
+| `/calib/control` | POST | `{"action":"start|next|finish|abort|reset", ...}` |
+| `/calib/stream` | GET | MJPEG calibration view with overlays |
 
 ### ServerNode Endpoints
 
@@ -252,7 +265,45 @@ web:
 | `/api/session/{id}/speed` | POST | Set speed |
 | `/api/session/{id}/rotate` | POST | Set rotation |
 | `/api/session/{id}/seek` | POST | Seek to time |
+| `/api/session/{id}/fusion` | GET | Pose-fusion track JSON (or `{"available": false, "reason": ...}`) |
+| `/api/session/{id}/fusion/frame/{frame_idx}` | GET | Single fusion track entry (404 if the frame has no entry) |
 | `/ws` | WS | Real-time WebSocket |
+
+## Pose Fusion
+
+Multi-camera AprilTag fusion (`pose_fusion.py`) reconstructs the robot's
+planar pose `(x, y, yaw)` per reference-camera frame from the per-frame tag
+detections stored in `.taps` **v0x03** recordings (see
+[`../common/taps_format.md`](../common/taps_format.md)).
+
+**Requirements**
+
+- v0x03 recordings (AprilTag extras enabled on the CameraNodes) in the session directory
+- A `fusion` section in `server_node.yaml` — see
+  [`../shared_config/fusion_example.yaml`](../shared_config/fusion_example.yaml) —
+  providing per-camera `T_field_cam` (4×4 row-major camera pose in the field frame,
+  keyed by the `camera_alias` stored in each file header), per-tag `T_robot_tag`
+  for the rigid tag mounts on the robot, `window_ms` (cross-camera PPS alignment
+  window), and an optional `reference_camera` (default: longest recording)
+- `numpy` (see `requirements.txt`)
+
+**Endpoints** (read-only, computed lazily on first request, cached in memory):
+`GET /api/session/{id}/fusion` returns `{"available": true, "reference_camera", "window_ms",
+"cameras", "tag_ids", "n_frames", "track": [...]}` or `{"available": false, "reason": ...}`
+(e.g. "no fusion config", v0x02-only recordings). Track entries:
+`{"frame", "ptp_ns", "x", "y", "yaw_deg"|null, "n_obs", "n_cameras", "rms", "candidates": [...]}`.
+`GET /api/session/{id}/fusion/frame/{frame_idx}` returns one entry or 404.
+Results are also cached on disk as `fusion_track.json` inside the session directory and
+recomputed automatically when any `.taps` file is newer.
+
+**Caveats (v1 heuristics — not calibrated)**
+
+- Observation weighting uses `σ = (reproj_error_rms_px / tag_px_diag) × distance` —
+  an angular-pose-error × range model, not a true covariance; `decision_margin` and
+  `hamming` are recorded but unused in the weights
+- Tag mount heights are projected out (planar model); a single observation yields
+  `x, y` with `yaw_deg: null`
+- Frames with no accepted detections simply have no track entry (the frame endpoint 404s)
 
 ## Development Notes
 

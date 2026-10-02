@@ -24,6 +24,7 @@ from server_node.session_manager import SessionManager
 from server_node.log_poller import LogPoller
 from server_node.log_sync import LogSync
 from server_node.playback_engine import PlaybackEngine
+from server_node.pose_fusion import get_fusion_track
 
 logger = logging.getLogger('server_node.web_server')
 
@@ -57,6 +58,9 @@ class WebServer:
         # Marker managers (per session)
         self._marker_managers: dict[str, MarkerManager] = {}
         self._update_task: Optional[asyncio.Task] = None
+
+        # In-memory fusion track cache (per session, computed lazily)
+        self._fusion_cache: dict[str, dict] = {}
 
     async def start(self):
         """Start the HTTP server."""
@@ -112,6 +116,11 @@ class WebServer:
         app.router.add_get('/api/session/{session_id}/logs', self.handle_session_logs)
         app.router.add_get('/api/session/{session_id}/markers', self.handle_session_markers)
         app.router.add_post('/api/session/{session_id}/markers', self.handle_create_marker)
+
+        # API - Pose fusion (read-only)
+        app.router.add_get('/api/session/{session_id}/fusion', self.handle_session_fusion)
+        app.router.add_get('/api/session/{session_id}/fusion/frame/{frame_idx}',
+                           self.handle_session_fusion_frame)
 
         # API - Playback controls
         app.router.add_post('/api/session/{session_id}/play', self.handle_play)
@@ -280,6 +289,77 @@ class WebServer:
                     break
 
         return self._marker_managers.get(session_id)
+
+    # ------------------------------------------------------------------
+    #  Pose fusion handlers (read-only)
+    # ------------------------------------------------------------------
+
+    def _get_fusion_config(self) -> Optional[dict]:
+        """Return the raw `fusion` section from the loaded server_node.yaml config."""
+        fusion = getattr(self.config, 'fusion', None)
+        if isinstance(fusion, dict) and fusion:
+            return fusion
+        return None
+
+    async def _get_fusion_data(self, session_id: str) -> dict:
+        """Get the fusion track JSON for a session, computing it lazily once.
+
+        Cached in memory per session (disk cache lives in the session
+        directory as fusion_track.json, handled by pose_fusion). Returns
+        {"available": false, "reason": ...} when fusion cannot run.
+        """
+        if session_id in self._fusion_cache:
+            return self._fusion_cache[session_id]
+
+        fusion_cfg = self._get_fusion_config()
+        if fusion_cfg is None:
+            return {'available': False, 'reason': 'no fusion config'}
+
+        session_path = None
+        for s in self.playback_engine.enumerate_sessions():
+            if s['id'] == session_id:
+                session_path = s['path']
+                break
+        if session_path is None:
+            return {'available': False, 'reason': 'session not found'}
+
+        try:
+            # Full recording scan — run off the event loop
+            track = await asyncio.to_thread(get_fusion_track, session_path, fusion_cfg)
+        except Exception as e:
+            logger.error(f"Fusion computation failed for session {session_id}: {e}")
+            return {'available': False, 'reason': f'fusion failed: {e}'}
+
+        if track is None:
+            return {'available': False,
+                    'reason': 'no v0x03 AprilTag data for the configured cameras'}
+
+        self._fusion_cache[session_id] = track
+        return track
+
+    async def handle_session_fusion(self, request: web.Request) -> web.Response:
+        """Get the full pose-fusion track JSON (or {"available": false, "reason": ...})."""
+        session_id = request.match_info['session_id']
+        data = await self._get_fusion_data(session_id)
+        return web.json_response(data)
+
+    async def handle_session_fusion_frame(self, request: web.Request) -> web.Response:
+        """Get a single pose-fusion track entry by frame index."""
+        session_id = request.match_info['session_id']
+        try:
+            frame_idx = int(request.match_info['frame_idx'])
+        except ValueError:
+            return web.json_response({'error': 'Invalid frame index'}, status=400)
+
+        data = await self._get_fusion_data(session_id)
+        if not data.get('available'):
+            return web.json_response(data, status=404)
+
+        for entry in data.get('track', []):
+            if entry.get('frame') == frame_idx:
+                return web.json_response(entry)
+        return web.json_response({'error': f'No fusion track entry for frame {frame_idx}'},
+                                 status=404)
 
     async def handle_play(self, request: web.Request) -> web.Response:
         """Start playback."""

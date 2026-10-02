@@ -24,9 +24,25 @@ VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mkv', '.mov', '.m4v', '.webm'}
 
 
 # .taps file constants
-TAPS_MAGIC = b'TaPS\x02'
+TAPS_MAGIC = b'TaPS\x02'        # legacy alias for the v0x02 signature
+TAPS_MAGIC_V2 = b'TaPS\x02'
+TAPS_MAGIC_V3 = b'TaPS\x03'     # v0x03 adds camera metadata + per-frame AprilTag extras
 ENCODER_JPEG = 0
 ENCODER_RAW = 1
+
+VERSION_V2 = 2
+VERSION_V3 = 3
+
+# Packed frame-header layouts, little-endian, no padding (see common/taps_format.md):
+_FRAME_HEADER_FMT_V2 = '<QqI'   # frame_idx u64, ptp_ns i64, frame_size u32        = 20 bytes
+_FRAME_HEADER_FMT_V3 = '<QqII'  # ...+ meta_size u32                               = 24 bytes
+
+# Packed TagRecord layout (64 bytes, see common/taps_format.md):
+# tag_id u16, decision_margin f32, hamming u8, pose_valid u8, translation 3×f32,
+# rotation 9×f32 (row-major), reproj_error_rms_px f32, tag_px_diag f32
+TAG_RECORD_SIZE = 64
+_TAG_RECORD_FMT = '<HfBB3f9fff'
+assert struct.calcsize(_TAG_RECORD_FMT) == TAG_RECORD_SIZE
 
 
 # ---------------------------------------------------------------------------
@@ -35,13 +51,42 @@ ENCODER_RAW = 1
 
 @dataclass
 class TapsFileHeader:
-    """Parsed .taps file header."""
+    """Parsed .taps file header (fields shared by v0x02 and v0x03, plus v0x03 extras)."""
     encoder_type: int
     width: int
     height: int
     target_fps: float
     encoder_args: str
     frame_count: int
+    # --- v0x03 extras; v0x02 files keep the defaults (0 / None) ---
+    version: int = VERSION_V2
+    fx: float = 0.0
+    fy: float = 0.0
+    cx: float = 0.0
+    cy: float = 0.0
+    tag_size_m: float = 0.0
+    camera_alias: Optional[str] = None
+    tag_family: Optional[str] = None
+
+
+@dataclass
+class TagDetection:
+    """A single AprilTag detection from a v0x03 per-frame meta block.
+
+    Field semantics per common/taps_format.md:
+      translation — tag origin in the camera frame, meters (+z forward, +x right, +y down)
+      rotation    — row-major 3x3 camera<-tag rotation matrix (all zeros if not pose_valid)
+      reproj_error_rms_px — primary pose-uncertainty proxy
+      tag_px_diag — apparent tag diagonal in pixels
+    """
+    tag_id: int
+    decision_margin: float
+    hamming: int
+    pose_valid: bool
+    translation: tuple
+    rotation: tuple
+    reproj_error_rms_px: float
+    tag_px_diag: float
 
 
 @dataclass
@@ -50,56 +95,129 @@ class TapsFrame:
     frame_idx: int
     ptp_ns: int
     data: bytes
+    tags: list = field(default_factory=list)  # list[TagDetection]; empty for v0x02 / meta_size 0
+
+
+def parse_tag_meta(meta: bytes) -> list:
+    """Parse a v0x03 tag-meta block: u8 tag_count followed by packed 64-byte TagRecords."""
+    detections: list[TagDetection] = []
+    if not meta:
+        return detections
+
+    tag_count = meta[0]
+    offset = 1
+    for i in range(tag_count):
+        if offset + TAG_RECORD_SIZE > len(meta):
+            logger.warning(f"Truncated tag meta block: record {i} of {tag_count} incomplete")
+            break
+        v = struct.unpack_from(_TAG_RECORD_FMT, meta, offset)
+        detections.append(TagDetection(
+            tag_id=v[0],
+            decision_margin=float(v[1]),
+            hamming=v[2],
+            pose_valid=bool(v[3]),
+            translation=(float(v[4]), float(v[5]), float(v[6])),
+            rotation=tuple(float(x) for x in v[7:16]),
+            reproj_error_rms_px=float(v[16]),
+            tag_px_diag=float(v[17]),
+        ))
+        offset += TAG_RECORD_SIZE
+    return detections
 
 
 class TapsReader:
-    """Reader for .taps video files."""
+    """Reader for .taps video files (v0x02 baseline and v0x03 AprilTag extras).
+
+    Public API is unchanged from v0x02: frames carry (frame_idx, ptp_ns, data);
+    v0x03 files additionally fill TapsFrame.tags with TagDetection records.
+    """
 
     def __init__(self, file_path: str):
         self.file_path = file_path
         self._file: Optional[open] = None
         self.header: Optional[TapsFileHeader] = None
+        self.version: int = VERSION_V2
         self._first_frame_offset: int = 0
+        # frame_idx -> byte offset of that frame's packed header (grown during scans)
+        self._frame_offsets: dict[int, int] = {}
         self._load_header()
 
+    # ------------------------------------------------------------------
+    #  Header parsing
+    # ------------------------------------------------------------------
+
+    def _read_more(self, raw: bytes, needed: int) -> bytes:
+        """Extend the incremental header buffer until it holds at least `needed` bytes."""
+        while len(raw) < needed:
+            chunk = self._file.read(max(needed - len(raw), 64))
+            if not chunk:
+                raise ValueError(
+                    f"Unexpected EOF in .taps header (needed {needed} bytes, got {len(raw)})")
+            raw += chunk
+        return raw
+
     def _load_header(self):
-        """Read and validate the .taps file header."""
+        """Read and validate the .taps file header (v0x02 or v0x03)."""
         try:
             self._file = open(self.file_path, 'rb')
-            raw = self._file.read(32)  # Read enough for header
+            raw = self._file.read(48)  # incremental; extended below as fields demand
 
-            if len(raw) < 5 or raw[:5] != TAPS_MAGIC:
-                raise ValueError(f"Invalid .taps file: bad magic")
+            if len(raw) < 5 or raw[:5] not in (TAPS_MAGIC_V2, TAPS_MAGIC_V3):
+                raise ValueError("Invalid .taps file: bad magic")
 
-            # Parse header fields (packed struct)
-            # After magic (5 bytes): encoder_type(1), width(8), height(8), fps(8),
-            # args_length(4), args(variable), frame_count(8)
+            version = raw[4]
+            self.version = int(version)
+
+            # Packed layout (see common/taps_format.md):
+            #   magic(5) encoder(u8) width(u64) height(u64) target_fps(f64)
+            #   encoder_args_length(u32) encoder_args(N bytes) frame_count(u64)
+            #   [v0x03] fx,fy,cx,cy (4×f64) tag_size_m(f64)
+            #           alias_len(u32) camera_alias(M bytes)
+            #           family_len(u32) tag_family(F bytes)
             offset = 5
-            encoder_type = struct.unpack_from('B', raw, offset)[0]
+            encoder_type = struct.unpack_from('<B', raw, offset)[0]
             offset += 1
 
-            if len(raw) < offset + 32:
-                # Need more data
-                extra = self._file.read(64)
-                raw += extra
-
-            width = struct.unpack_from('Q', raw, offset)[0]
+            raw = self._read_more(raw, offset + 28)  # width + height + fps + args_length
+            width = struct.unpack_from('<Q', raw, offset)[0]
             offset += 8
-            height = struct.unpack_from('Q', raw, offset)[0]
+            height = struct.unpack_from('<Q', raw, offset)[0]
             offset += 8
-            target_fps = struct.unpack_from('d', raw, offset)[0]
+            target_fps = struct.unpack_from('<d', raw, offset)[0]
             offset += 8
 
-            args_length = struct.unpack_from('I', raw, offset)[0]
+            args_length = struct.unpack_from('<I', raw, offset)[0]
+            offset += 4  # uint32, not 8!
+
+            raw = self._read_more(raw, offset + args_length + 8)  # args + frame_count
+            encoder_args = raw[offset:offset + args_length].decode('utf-8', errors='replace')
+            offset += args_length
+
+            frame_count = struct.unpack_from('<Q', raw, offset)[0]
             offset += 8
 
-            # Read encoder args
-            encoder_args = ''
-            if args_length > 0 and len(raw) >= offset + args_length:
-                encoder_args = raw[offset:offset + args_length].decode('utf-8', errors='replace')
-                offset += args_length
+            fx = fy = cx = cy = 0.0
+            tag_size_m = 0.0
+            camera_alias: Optional[str] = None
+            tag_family: Optional[str] = None
+            if version == VERSION_V3:
+                raw = self._read_more(raw, offset + 40)  # 4×f64 intrinsics + f64 tag size
+                fx, fy, cx, cy = struct.unpack_from('<4d', raw, offset)
+                offset += 32
+                tag_size_m = struct.unpack_from('<d', raw, offset)[0]
+                offset += 8
 
-            frame_count = struct.unpack_from('Q', raw, offset)[0]
+                alias_len = struct.unpack_from('<I', raw, offset)[0]
+                offset += 4
+                raw = self._read_more(raw, offset + alias_len + 4)  # alias + family_len
+                camera_alias = raw[offset:offset + alias_len].decode('utf-8', errors='replace')
+                offset += alias_len
+
+                family_len = struct.unpack_from('<I', raw, offset)[0]
+                offset += 4
+                raw = self._read_more(raw, offset + family_len)
+                tag_family = raw[offset:offset + family_len].decode('utf-8', errors='replace')
+                offset += family_len
 
             self.header = TapsFileHeader(
                 encoder_type=encoder_type,
@@ -108,43 +226,106 @@ class TapsReader:
                 target_fps=float(target_fps),
                 encoder_args=encoder_args,
                 frame_count=int(frame_count),
+                version=int(version),
+                fx=float(fx),
+                fy=float(fy),
+                cx=float(cx),
+                cy=float(cy),
+                tag_size_m=float(tag_size_m),
+                camera_alias=camera_alias,
+                tag_family=tag_family,
             )
 
-            # Store first frame offset
-            self._first_frame_offset = self._file.tell()
+            # First frame begins exactly after the packed header. Computed from
+            # the parsed layout — NOT file.tell(), which trails the buffered read.
+            self._first_frame_offset = offset
+            self._frame_offsets = {}
+            self._file.seek(self._first_frame_offset)  # read_next_frame() starts at frame 0
 
         except Exception as e:
             if self._file:
                 self._file.close()
+                self._file = None
             raise ValueError(f"Failed to read .taps header {self.file_path}: {e}")
 
+    # ------------------------------------------------------------------
+    #  Frame parsing
+    # ------------------------------------------------------------------
+
+    def _frame_header_fmt(self) -> str:
+        return _FRAME_HEADER_FMT_V3 if self.version == VERSION_V3 else _FRAME_HEADER_FMT_V2
+
+    def _read_frame_header_at(self, offset: int):
+        """Read the packed frame header at `offset`.
+
+        Returns (frame_idx, ptp_ns, frame_size, meta_size) with the file
+        positioned just after the header (at the image payload), or None at EOF.
+        meta_size is always 0 for v0x02.
+        """
+        fmt = self._frame_header_fmt()
+        size = struct.calcsize(fmt)
+        self._file.seek(offset)
+        header_data = self._file.read(size)
+        if len(header_data) < size:
+            return None
+        fields = struct.unpack_from(fmt, header_data)
+        if len(fields) == 4:
+            return fields
+        return (fields[0], fields[1], fields[2], 0)
+
+    def _locate(self, frame_idx: int):
+        """Position the file at frame `frame_idx`'s payload and return its header tuple.
+
+        Uses an internal frame-index map grown during scans, so repeated
+        seeks/reads are incremental instead of always restarting from frame 0.
+        Both payloads (image + v0x03 meta) are skipped while scanning.
+        """
+        start_offset = self._first_frame_offset
+        best_known = -1
+        for i, off in self._frame_offsets.items():
+            if i <= frame_idx and i > best_known:
+                best_known = i
+                start_offset = off
+
+        pos = start_offset
+        header_size = struct.calcsize(self._frame_header_fmt())
+        while True:
+            fields = self._read_frame_header_at(pos)
+            if fields is None:
+                return None
+            f_idx, _ptp_ns, f_size, meta_size = fields
+            self._frame_offsets[f_idx] = pos
+            if f_idx == frame_idx:
+                return fields
+            if f_idx > frame_idx:
+                return None  # frame_idx is dense per spec; a jump means it is missing
+            pos += header_size + f_size + meta_size
+
+    def _read_tags(self, meta_size: int) -> list:
+        """Read and parse the tag-meta block positioned at the current file offset."""
+        if meta_size <= 0:
+            return []
+        meta = self._file.read(meta_size)
+        if len(meta) < meta_size:
+            logger.warning(f"Truncated tag meta block: expected {meta_size}, got {len(meta)}")
+        return parse_tag_meta(meta)
+
     def read_frame(self, frame_idx: int) -> Optional[TapsFrame]:
-        """Read a specific frame by index."""
+        """Read a specific frame by index (TapsFrame.tags populated on v0x03)."""
         if not self._file:
             return None
 
         try:
-            # Seek to first frame
-            self._file.seek(self._first_frame_offset)
+            fields = self._locate(frame_idx)
+            if fields is None:
+                return None
+            f_idx, ptp_ns, f_size, meta_size = fields
 
-            # Linear scan to target frame
-            for i in range(frame_idx + 1):
-                # Read frame header: frame_idx(8), ptp_ns(8), frame_size(4) = 20 bytes
-                header_data = self._file.read(20)
-                if len(header_data) < 20:
-                    return None
-
-                f_idx, ptp_ns, f_size = struct.unpack_from('QqI', header_data, 0)
-
-                if f_idx == frame_idx:
-                    # Read frame data
-                    data = self._file.read(f_size)
-                    if len(data) < f_size:
-                        return None
-                    return TapsFrame(frame_idx=f_idx, ptp_ns=ptp_ns, data=data)
-
-                # Skip frame data
-                self._file.seek(f_size, 1)
+            data = self._file.read(f_size)
+            if len(data) < f_size:
+                return None
+            tags = self._read_tags(meta_size)
+            return TapsFrame(frame_idx=f_idx, ptp_ns=ptp_ns, data=data, tags=tags)
 
         except Exception as e:
             logger.error(f"Failed to read frame {frame_idx}: {e}")
@@ -157,41 +338,33 @@ class TapsReader:
             return None
 
         try:
-            header_data = self._file.read(20)
-            if len(header_data) < 20:
+            fmt = self._frame_header_fmt()
+            size = struct.calcsize(fmt)
+            header_data = self._file.read(size)
+            if len(header_data) < size:
                 return None
 
-            f_idx, ptp_ns, f_size = struct.unpack_from('QqI', header_data, 0)
+            fields = struct.unpack_from(fmt, header_data)
+            f_idx, ptp_ns, f_size = fields[0], fields[1], fields[2]
+            meta_size = fields[3] if len(fields) > 3 else 0
 
             data = self._file.read(f_size)
             if len(data) < f_size:
                 return None
-
-            return TapsFrame(frame_idx=f_idx, ptp_ns=ptp_ns, data=data)
+            tags = self._read_tags(meta_size)
+            return TapsFrame(frame_idx=f_idx, ptp_ns=ptp_ns, data=data, tags=tags)
 
         except Exception as e:
             logger.error(f"Failed to read next frame: {e}")
             return None
 
     def seek_to_frame(self, frame_idx: int) -> bool:
-        """Seek to a specific frame index."""
+        """Seek to a specific frame index (file ends up just past its header)."""
         if not self._file:
             return False
 
         try:
-            self._file.seek(self._first_frame_offset)
-
-            for i in range(frame_idx + 1):
-                header_data = self._file.read(20)
-                if len(header_data) < 20:
-                    return False
-
-                f_idx, ptp_ns, f_size = struct.unpack_from('QqI', header_data, 0)
-
-                if f_idx == frame_idx:
-                    return True
-
-                self._file.seek(f_size, 1)
+            return self._locate(frame_idx) is not None
 
         except Exception as e:
             logger.error(f"Failed to seek to frame {frame_idx}: {e}")
@@ -203,6 +376,7 @@ class TapsReader:
         if self._file:
             self._file.close()
             self._file = None
+        self._frame_offsets = {}
 
     def __enter__(self):
         return self
