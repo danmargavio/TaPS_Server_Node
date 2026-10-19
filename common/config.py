@@ -186,6 +186,10 @@ class CameraConfig:
     def recording_url(self) -> str:
         return f"http://{self.host}:{self.http_port}/recording"
 
+    @property
+    def status_url(self) -> str:
+        return f"http://{self.host}:{self.http_port}/status"
+
 
 # ---------------------------------------------------------------------------
 # ServerNode configuration

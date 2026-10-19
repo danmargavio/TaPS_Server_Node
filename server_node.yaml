@@ -1,34 +1,55 @@
-# TaPS ServerNode Configuration Template
-# Copy this file to server_node.yaml and edit for your setup.
+# TaPS ServerNode Configuration - local bench setup against CameraNode1
 
 cameras:
   - name: "CameraNode1"
-    host: "10.0.1.11"
-    http_port: 8080
-  - name: "CameraNode2"
-    host: "10.0.1.12"
-    http_port: 8080
-  - name: "CameraNode3"
-    host: "10.0.1.13"
-    http_port: 8080
-  - name: "CameraNode4"
-    host: "10.0.1.14"
+    host: "192.168.4.66"
     http_port: 8080
 
 network_tables:
-  server: "10.0.1.X"    # RoboRIO NetworkTables IP address
+  server: "10.0.1.X"    # RoboRIO NetworkTables IP address (not present on bench)
   match_start_topic: "RoboRIO/matchStart"
   match_end_topic: "RoboRIO/matchEnd"
 
 smb_share:
-  path: "\\\\10.0.2.X\\share\\logs"  # Robot Control PC SMB share
-  username: ""                # Leave empty for anonymous/guest access
-  password: ""                # Leave empty if not needed
-  poll_interval: 30           # Seconds between SMB share checks
+  path: "\\\\10.0.2.X\\share\\logs"  # Robot Control PC SMB share (not present on bench)
+  username: ""
+  password: ""
+  poll_interval: 30
 
 recording:
-  output_dir: "C:/Users/Dan/Documents/deepseek/TaPS/TaPS_Consolidated/server_node/recordings"   # Local path for recorded .taps files
+  output_dir: "C:/Users/Dan/Documents/deepseek/TaPS/TaPS_Consolidated/server_node/recordings"
 
 web:
-  host: "0.0.0.0"             # Bind address
-  port: 8080                  # HTTP server port
+  host: "0.0.0.0"
+  port: 8090
+
+# Pose fusion (bench approximation - see shared_config/fusion_example.yaml
+# for the schema; production values must be surveyed once per field layout).
+# Field frame: origin under the camera tripod, +X = camera look direction,
+# +Z up, meters. Camera pose: 1.0 m high, looking horizontally along +X
+# (camera +z -> field +X, +x -> -Y, +y -> -Z).
+fusion:
+  window_ms: 66          # ~1 frame period at the C925e's real 15 fps
+  reference_camera: CameraNode1
+  cameras:
+    - alias: CameraNode1
+      T_field_cam: [0.0,  0.0, 1.0, 0.0,
+                   -1.0,  0.0, 0.0, 0.0,
+                    0.0, -1.0, 0.0, 1.0,
+                    0.0,  0.0, 0.0, 1.0]
+  tags:
+    4:                   # tag presented during OV9782 verification 2026-10-18
+      T_robot_tag: [1.0, 0.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0, 0.0,
+                    0.0, 0.0, 1.0, 0.10,
+                    0.0, 0.0, 0.0, 1.0]
+    14:                  # the tag actually printed for this bench session
+      T_robot_tag: [1.0, 0.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0, 0.0,
+                    0.0, 0.0, 1.0, 0.10,
+                    0.0, 0.0, 0.0, 1.0]
+    41:                  # single bench tag; treated as mounted at robot center
+      T_robot_tag: [1.0, 0.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0, 0.0,
+                    0.0, 0.0, 1.0, 0.10,
+                    0.0, 0.0, 0.0, 1.0]

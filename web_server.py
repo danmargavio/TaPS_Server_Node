@@ -5,6 +5,9 @@ aiohttp server providing REST API, WebSocket, and static frontend.
 """
 
 import asyncio
+import csv
+import datetime
+import io
 import json
 import logging
 import sys
@@ -16,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from marker_manager import MarkerManager
 
-from aiohttp import web, WSMsgType
+from aiohttp import ClientSession, ClientTimeout, web, WSMsgType
 
 from common.config import ServerNodeConfig
 from server_node.camera_aggregator import CameraAggregator
@@ -104,6 +107,7 @@ class WebServer:
         # API - Cameras
         app.router.add_get('/api/cameras', self.handle_cameras)
         app.router.add_get('/api/cameras/{index}/stream', self.handle_camera_stream)
+        app.router.add_post('/api/cameras/{index}/lowpower', self.handle_camera_lowpower)
 
         # API - Grid
         app.router.add_get('/api/grid/stream', self.handle_grid_stream)
@@ -121,6 +125,8 @@ class WebServer:
         app.router.add_get('/api/session/{session_id}/fusion', self.handle_session_fusion)
         app.router.add_get('/api/session/{session_id}/fusion/frame/{frame_idx}',
                            self.handle_session_fusion_frame)
+        app.router.add_get('/api/session/{session_id}/fusion.csv',
+                           self.handle_session_fusion_csv)
 
         # API - Playback controls
         app.router.add_post('/api/session/{session_id}/play', self.handle_play)
@@ -165,23 +171,91 @@ class WebServer:
         status = self.camera_aggregator.get_status()
         return web.json_response({'cameras': status})
 
-    async def handle_camera_stream(self, request: web.Request) -> web.Response:
-        """Proxy a single camera MJPEG stream."""
+    async def _multipart_frames(self, request: web.Request, get_bytes, fps: float = 15.0):
+        """Stream the aggregator's latest cached frame as MJPEG multipart.
+
+        The aggregator refreshes each camera's cache in the background; this
+        re-sends it whenever it changes so a plain <img> tag animates.
+        """
+        resp = web.StreamResponse(
+            status=200,
+            headers={
+                'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
+                'Cache-Control': 'no-cache, no-store, must-revalidate',
+                'Connection': 'close',
+                'X-Accel-Buffering': 'no',
+            },
+        )
+        await resp.prepare(request)
+        last_data = None
+        interval = 1.0 / max(fps, 1.0)
+        crlf = bytes([13, 10])
+        try:
+            while True:
+                data = await get_bytes()
+                if data and data != last_data:
+                    head = (b'--frame' + crlf +
+                            b'Content-Type: image/jpeg' + crlf +
+                            b'Content-Length: ' + str(len(data)).encode() + crlf + crlf)
+                    await resp.write(head + data + crlf)
+                    last_data = data
+                await asyncio.sleep(interval)
+        except (asyncio.CancelledError, ConnectionResetError):
+            pass
+        except Exception as e:
+            logger.debug(f"MJPEG stream ended: {e}")
+        finally:
+            try:
+                await resp.write_eof()
+            except Exception:
+                pass
+        return resp
+
+    async def handle_camera_stream(self, request: web.Request) -> web.StreamResponse:
+        """Stream a single camera as MJPEG (multipart) from the aggregator cache."""
         try:
             index = int(request.match_info['index'])
-            frame = await self.camera_aggregator.get_frame(index)
-            if frame is None:
-                return web.Response(status=404, text='No stream available')
-            return web.Response(body=frame, content_type='image/jpeg')
         except (ValueError, KeyError):
             return web.Response(status=400, text='Invalid camera index')
+        return await self._multipart_frames(
+            request, lambda: self.camera_aggregator.get_frame(index))
 
-    async def handle_grid_stream(self, request: web.Request) -> web.Response:
-        """Proxy the composed 2x2 grid MJPEG stream."""
-        frame = await self.camera_aggregator.get_grid_frame()
-        if frame is None:
-            return web.Response(status=404, text='No grid available')
-        return web.Response(body=frame, content_type='image/jpeg')
+    async def handle_camera_lowpower(self, request: web.Request) -> web.Response:
+        """Toggle a CameraNode's low power mode (proxy to the node's /lowpower).
+
+        Body: {"enable": true|false}. CameraNodes boot in low power by
+        default; the node stops any recording itself before parking the
+        camera. Returns the node's own JSON (and HTTP status) verbatim.
+        """
+        try:
+            index = int(request.match_info['index'])
+        except ValueError:
+            return web.json_response({'error': 'index must be an integer'}, status=400)
+        cache = self.camera_aggregator.caches.get(index)
+        if cache is None:
+            return web.json_response({'error': f'no camera index {index}'}, status=404)
+        url = f"http://{cache.camera.host}:{cache.camera.http_port}/lowpower"
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        enable = bool(body.get('enable', True))
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=5)) as session:
+                async with session.post(url, json={'enable': enable}) as resp:
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        data = {'error': f'node returned non-JSON (HTTP {resp.status})'}
+                    logger.info(f"HTTP: /api/cameras/{index}/lowpower enable={enable} -> {data}")
+                    return web.json_response(data, status=resp.status)
+        except Exception as e:
+            return web.json_response({'error': f'{type(e).__name__}: {e}'}, status=502)
+
+    async def handle_grid_stream(self, request: web.Request) -> web.StreamResponse:
+        """Stream the composed 2x2 grid as MJPEG (multipart)."""
+        return await self._multipart_frames(
+            request, self.camera_aggregator.get_grid_frame)
 
     async def handle_sessions_list(self, request: web.Request) -> web.Response:
         """List available recording sessions."""
@@ -360,6 +434,50 @@ class WebServer:
                 return web.json_response(entry)
         return web.json_response({'error': f'No fusion track entry for frame {frame_idx}'},
                                  status=404)
+
+    async def handle_session_fusion_csv(self, request: web.Request) -> web.Response:
+        """Export the fusion track as CSV (download).
+
+        Derived from the same lazily-computed/cached track as the JSON
+        endpoint - no extra persistence, so it can never go stale relative
+        to fusion_track.json. Columns carry the absolute PPS-disciplined
+        time (ptp_ns + UTC ISO) alongside the relative clip time, so the
+        file aligns to any external log later.
+        """
+        session_id = request.match_info['session_id']
+        data = await self._get_fusion_data(session_id)
+        if not data.get('available'):
+            return web.json_response(data, status=404)
+
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(['frame', 't_rel_s', 'ptp_ns', 'utc_iso',
+                         'x_m', 'y_m', 'yaw_deg', 'n_obs', 'n_cameras', 'rms_m',
+                         'observations'])
+        track = data.get('track') or []
+        t0 = track[0]['ptp_ns'] if track else 0
+        for e in track:
+            ptp = int(e.get('ptp_ns', 0))
+            try:
+                iso = datetime.datetime.fromtimestamp(
+                    ptp / 1e9, datetime.timezone.utc).isoformat(timespec='microseconds')
+            except (OverflowError, OSError, ValueError):
+                iso = ''
+            obs = ';'.join(f"{c.get('camera')}:tag{c.get('tag_id')}"
+                           for c in (e.get('candidates') or []))
+            yaw = e.get('yaw_deg')
+            writer.writerow([
+                e.get('frame'), f"{(ptp - t0) / 1e9:.6f}", ptp, iso,
+                f"{e['x']:.4f}" if e.get('x') is not None else '',
+                f"{e['y']:.4f}" if e.get('y') is not None else '',
+                f"{yaw:.2f}" if yaw is not None else '',
+                e.get('n_obs'), e.get('n_cameras'),
+                f"{e.get('rms', 0.0):.5f}", obs,
+            ])
+        filename = f"{session_id}_fusion.csv"
+        return web.Response(
+            text=buf.getvalue(), content_type='text/csv',
+            headers={'Content-Disposition': f'attachment; filename="{filename}"'})
 
     async def handle_play(self, request: web.Request) -> web.Response:
         """Start playback."""

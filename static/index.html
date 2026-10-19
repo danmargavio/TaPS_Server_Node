@@ -380,6 +380,18 @@
         .camera-dot.online { background-color: var(--success); }
         .camera-dot.offline { background-color: var(--danger); }
 
+        .camera-badge {
+            margin-left: auto;
+            align-self: center;
+            font-size: 0.65rem;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            padding: 2px 8px;
+            border-radius: 10px;
+        }
+        .camera-badge.lowpower { background-color: #f59e0b; color: #1c1917; }
+        .camera-badge.rec { background-color: var(--danger); color: #fff; }
+
         .camera-name { font-size: 0.85rem; }
         .camera-info { font-size: 0.75rem; color: var(--text-muted); }
 
@@ -443,6 +455,11 @@
             <img id="live-stream" src="" alt="Live Stream" style="display: none;">
             <canvas id="playback-canvas" style="display: none;"></canvas>
             <div id="log-overlay" class="log-overlay"></div>
+        </div>
+
+        <!-- Fused robot pose HUD (per-frame, from /api/session/{id}/fusion) -->
+        <div id="fusion-hud" style="display: none; font-family: monospace; font-size: 0.78rem; padding: 5px 14px; background: #0b1220; border-top: 1px solid #1e293b; white-space: nowrap; overflow-x: auto; color: #7dd3fc;">
+            <span id="fusion-hud-text"></span><a id="fusion-hud-csv" style="display: none; color: #38bdf8; margin-left: 14px; text-decoration: none;" download>csv &#11015;</a>
         </div>
 
         <!-- Controls -->
@@ -520,6 +537,9 @@
             this.sessionLoaded = false;
             this._localPlaying = false;
             this.playbackState = { playing: false, time: 0, speed: 1.0, frame: 0 };
+            this.fusion = null;          // Map frame -> fused pose entry
+            this.fusionMeta = '';
+            this.fusionReason = '';
             this.markers = [];
             this.selectedMarkerType = 'NOTE';
             this.currentRotation = [0, 0, 0, 0];
@@ -586,15 +606,21 @@
 
         renderCameraStatus(cameras) {
             const container = document.getElementById('camera-status');
-            container.innerHTML = cameras.map(c => `
+            container.innerHTML = cameras.map(c => {
+                const badge = c.low_power === true
+                    ? '<span class="camera-badge lowpower">LOW POWER</span>'
+                    : (c.recording_state === 1
+                        ? '<span class="camera-badge rec">REC</span>' : '');
+                return `
                 <div class="camera-status">
                     <span class="camera-dot ${c.connected ? 'online' : 'offline'}"></span>
                     <div>
                         <div class="camera-name">${c.name}</div>
-                        <div class="camera-info">${c.host} · ${c.frame_count} frames</div>
+                        <div class="camera-info">${c.host} · ${c.frame_count} frames${c.low_power === true ? ' · camera off' : ''}</div>
                     </div>
-                </div>
-            `).join('');
+                    ${badge}
+                </div>`;
+            }).join('');
         }
 
         // --- Sessions ---
@@ -651,6 +677,8 @@
                     this.enablePlaybackControls(true);
                     // Load markers for this session
                     this.loadMarkers();
+                    // Load fused pose track (non-blocking; HUD shows 'computing' until it lands)
+                    this.loadFusion(sessionId);
                 } else {
                     console.warn('Session has no video files via API');
                     this.enablePlaybackControls(false);
@@ -659,6 +687,73 @@
                 console.error('Failed to load session via API:', e);
                 this.enablePlaybackControls(false);
             }
+        }
+
+        // --- Pose fusion HUD ---
+        async loadFusion(sessionId) {
+            this.fusion = null;
+            this.fusionMeta = '';
+            this.fusionReason = 'computing...';
+            this._fusionT0 = undefined;
+            this.updateFusionHud();
+            try {
+                const res = await fetch('/api/session/' + sessionId + '/fusion');
+                const data = await res.json();
+                if (this.sessionId !== sessionId) return;
+                if (data.available) {
+                    this.fusion = new Map();
+                    (data.track || []).forEach(e => this.fusion.set(e.frame, e));
+                    const ids = (data.tag_ids || []).join(',');
+                    this.fusionMeta = ' tags[' + ids + '] ' + this.fusion.size + '/' + (data.n_frames || 0);
+                    const csv = document.getElementById('fusion-hud-csv');
+                    csv.href = '/api/session/' + sessionId + '/fusion.csv';
+                    csv.download = sessionId + '_fusion.csv';
+                    this.fusionReason = '';
+                } else {
+                    this.fusionReason = data.reason || 'unavailable';
+                }
+            } catch (err) {
+                this.fusionReason = 'load failed';
+                console.warn('Fusion track load failed:', err);
+            }
+            this.updateFusionHud();
+        }
+
+        updateFusionHud() {
+            const bar = document.getElementById('fusion-hud');
+            const txt = document.getElementById('fusion-hud-text');
+            const csv = document.getElementById('fusion-hud-csv');
+            if (!bar || !txt || !csv) return;
+            if (!this.fusion) {
+                bar.style.display = this.fusionReason ? 'block' : 'none';
+                csv.style.display = 'none';
+                txt.textContent = this.fusionReason ? 'fusion: ' + this.fusionReason : '';
+                return;
+            }
+            const e = this.fusion.get(this.playbackState.frame);
+            bar.style.display = 'block';
+            csv.style.display = 'inline';
+            if (!e) {
+                txt.textContent = 'FUSED' + this.fusionMeta + ' | frame ' +
+                    this.playbackState.frame + ' | no pose (tag unseen)';
+                return;
+            }
+            if (this._fusionT0 === undefined) {
+                const first = this.fusion.values().next().value;
+                this._fusionT0 = first ? Number(first.ptp_ns) : 0;
+            }
+            const yaw = (e.yaw_deg === null || e.yaw_deg === undefined)
+                ? '-' : Number(e.yaw_deg).toFixed(1) + ' deg';
+            const tRel = ((Number(e.ptp_ns) - this._fusionT0) / 1e9).toFixed(3);
+            const tags = [...new Set((e.candidates || []).map(c => 'tag' + c.tag_id))].join('+');
+            txt.textContent = 'FUSED' + this.fusionMeta +
+                ' | t=' + tRel + 's' +
+                ' | x=' + Number(e.x).toFixed(3) + 'm' +
+                ' | y=' + Number(e.y).toFixed(3) + 'm' +
+                ' | yaw=' + yaw +
+                ' | obs=' + e.n_obs + ' (' + e.n_cameras + ' cam)' +
+                ' | rms=' + Number(e.rms || 0).toFixed(4) + 'm' +
+                ' | ' + tags;
         }
 
         // --- Playback ---
@@ -1203,6 +1298,7 @@
                         this.playbackState.frame = data.frame;
                         this.playbackState.speed = data.speed !== undefined ? data.speed : this.playbackState.speed;
                         this.updateTimeDisplay();
+                        this.updateFusionHud();
 
                         if (data.cameras) {
                             this.renderCameraStatus(data.cameras);

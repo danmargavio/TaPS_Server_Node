@@ -24,6 +24,10 @@ from common.config import CameraConfig
 
 logger = logging.getLogger('server_node.camera_aggregator')
 
+# MJPEG multipart markers (CRLF built numerically to keep them exact)
+HDR_END = bytes([13, 10, 13, 10])                 # end of a part header
+PART_BND = bytes([13, 10]) + b'--frame'           # start of the next part
+
 
 class CameraFrameCache:
     """Thread-safe cache for a single camera's latest frame."""
@@ -36,6 +40,10 @@ class CameraFrameCache:
         self._connected: bool = False
         self._error: str = ''
         self._frame_count: int = 0
+        # Remote power/recording state polled from the CameraNode /status
+        # endpoint. low_power: True/False once polled, None = unknown.
+        self._low_power: Optional[bool] = None
+        self._recording_state: int = -1
 
     @property
     def frame(self) -> Optional[np.ndarray]:
@@ -61,6 +69,14 @@ class CameraFrameCache:
     def frame_count(self) -> int:
         return self._frame_count
 
+    @property
+    def low_power(self) -> Optional[bool]:
+        return self._low_power
+
+    @property
+    def recording_state(self) -> int:
+        return self._recording_state
+
     def update_frame(self, jpeg_data: bytes) -> bool:
         """Decode and cache a new JPEG frame."""
         try:
@@ -78,6 +94,15 @@ class CameraFrameCache:
             self._error = str(e)
             logger.debug(f"Failed to decode frame from {self.camera.name}: {e}")
         return False
+
+    def set_remote_status(self, low_power: Optional[bool], recording_state: int):
+        """Update power/recording state learned from the node's /status."""
+        self._low_power = low_power
+        self._recording_state = recording_state
+
+    def mark_status_unknown(self):
+        self._low_power = None
+        self._recording_state = -1
 
     def mark_disconnected(self, error: str = ''):
         """Mark camera as disconnected."""
@@ -113,13 +138,15 @@ class CameraAggregator:
     async def start(self):
         """Start background tasks to fetch frames from all cameras."""
         self._running = True
+        # MJPEG streams are endless: no total timeout. sock_read detects a
+        # stalled stream (no bytes for 10 s) so we can reconnect.
         self._session = ClientSession(
-            timeout=ClientTimeout(total=5, connect=2)
+            timeout=ClientTimeout(total=None, connect=5, sock_read=10)
         )
 
         for i, cache in self.caches.items():
-            task = asyncio.create_task(self._fetch_loop(i, cache))
-            self._tasks.append(task)
+            self._tasks.append(asyncio.create_task(self._fetch_loop(i, cache)))
+            self._tasks.append(asyncio.create_task(self._status_loop(i, cache)))
 
         logger.info(f"Camera aggregator started for {len(self.camera_configs)} cameras")
 
@@ -134,52 +161,88 @@ class CameraAggregator:
         logger.info("Camera aggregator stopped")
 
     async def _fetch_loop(self, index: int, cache: CameraFrameCache):
-        """Background loop to fetch latest frame from a camera."""
+        """Background loop to fetch frames from a camera's MJPEG stream.
+
+        Stream framing (CameraNode StreamResource):
+            --frame CRLF
+            Content-Type: image/jpeg CRLF
+            Content-Length: N CRLF CRLF
+            <jpeg bytes> CRLF
+            --frame ... (next part)
+        Parse is a carry-over state machine over the raw byte stream:
+        never break on a partial frame, never drop the next part's header.
+        """
         stream_url = cache.camera.stream_url
         logger.info(f"Starting fetch loop for {cache.camera.name} at {stream_url}")
 
         while self._running:
+            buffer = b''
             try:
-                async with self._session.get(stream_url, timeout=3.0) as response:
+                async with self._session.get(stream_url) as response:
                     if response.status != 200:
                         cache.mark_disconnected(f"HTTP {response.status}")
                         await asyncio.sleep(1)
                         continue
 
-                    # MJPEG stream: read until we get a complete frame
-                    # The stream is multipart/x-mixed-replace with boundary "--frame"
-                    buffer = b''
                     while self._running:
-                        chunk = await response.content.readuntil(b'\r\n\r\n')
+                        chunk = await response.content.read(65536)
                         if not chunk:
-                            break
+                            break  # stream ended; reconnect
+
                         buffer += chunk
 
-                        # Check if we have a complete frame
-                        if b'\r\n--frame\r\n' in buffer or (
-                            b'Content-Type: image/jpeg\r\n' in buffer and
-                            b'\r\n' in buffer[buffer.rfind(b'\r\n'):]
-                        ):
-                            # Extract JPEG data between boundaries
-                            jpeg_start = buffer.find(b'\r\n\r\n')
-                            if jpeg_start > 0:
-                                jpeg_data = buffer[jpeg_start + 4:]
-                                # Find next boundary
-                                next_boundary = jpeg_data.find(b'\r\n--frame')
-                                if next_boundary > 0:
-                                    jpeg_data = jpeg_data[:next_boundary]
-                                    # Remove trailing \r\n
-                                    if jpeg_data.endswith(b'\r\n'):
-                                        jpeg_data = jpeg_data[:-2]
-                                    cache.update_frame(jpeg_data)
-                                    buffer = jpeg_data[next_boundary:]
-                                else:
-                                    # Frame goes until end of buffer, wait for more
-                                    break
+                        # Drain every complete part currently in the buffer.
+                        while True:
+                            hdr_end = buffer.find(HDR_END)
+                            if hdr_end < 0:
+                                break
+                            boundary = buffer.find(PART_BND, hdr_end)
+                            if boundary < 0:
+                                break  # payload still arriving
 
-            except (asyncio.TimeoutError, ClientError, Exception) as e:
-                cache.mark_disconnected(str(e)[:100])
+                            jpeg = buffer[hdr_end + 4:boundary]
+                            if jpeg:
+                                cache.update_frame(jpeg)
+                            # Next part starts right after the CRLF that
+                            # preceded '--frame'.
+                            buffer = buffer[boundary + 2:]
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                cache.mark_disconnected(f"{type(e).__name__}: {e}"[:100])
                 await asyncio.sleep(1)
+
+        logger.info(f"Fetch loop for {cache.camera.name} stopped")
+
+    async def _status_loop(self, index: int, cache: CameraFrameCache):
+        """Poll the CameraNode's /status endpoint (lightweight, ~1 KB).
+
+        A CameraNode in low power mode still serves /status and /stream, but
+        /stream carries only the placeholder frame and recording is refused
+        (409). Surfacing low_power lets the UI say 'camera off - low power'
+        instead of pretending a live image exists.
+        """
+        url = cache.camera.status_url
+        status_timeout = ClientTimeout(total=4)
+        while self._running:
+            try:
+                async with self._session.get(url, timeout=status_timeout) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        lp = data.get('low_power')
+                        cache.set_remote_status(
+                            bool(lp) if isinstance(lp, bool) else None,
+                            int(data.get('recording', -1)))
+                    else:
+                        cache.mark_status_unknown()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Older CameraNode builds have no /status; stay 'unknown'
+                # rather than flapping it on every timeout.
+                pass
+            await asyncio.sleep(2)
 
     async def get_frame(self, camera_index: int) -> Optional[bytes]:
         """Get the latest cached frame for a camera."""
@@ -199,13 +262,6 @@ class CameraAggregator:
                 # Use placeholder if camera is disconnected
                 frames.append(None)
 
-        if not any(f is not None for f in frames):
-            # All cameras offline, generate all placeholders
-            frames = [
-                cv2.imdecode(np.frombuffer(c.generate_placeholder(), np.uint8), cv2.IMREAD_COLOR)
-                for c in self.caches.values()
-            ]
-
         # Compose 2x2 grid
         grid_w, grid_h = self._grid_size
         tile_w = grid_w // 2
@@ -215,9 +271,12 @@ class CameraAggregator:
         for idx, frame in enumerate(frames):
             if frame is None:
                 # Placeholder
-                cache = self.caches[idx]
-                placeholder = cache.generate_placeholder((tile_w, tile_h))
-                frame = cv2.imdecode(np.frombuffer(placeholder, np.uint8), cv2.IMREAD_COLOR)
+                if idx in self.caches:
+                    cache = self.caches[idx]
+                    placeholder = cache.generate_placeholder((tile_w, tile_h))
+                    frame = cv2.imdecode(np.frombuffer(placeholder, np.uint8), cv2.IMREAD_COLOR)
+                else:
+                    continue  # camera not configured
 
             if frame is not None:
                 # Scale to tile size
@@ -247,10 +306,7 @@ class CameraAggregator:
                 'frame_count': cache.frame_count,
                 'last_update': cache.last_update,
                 'error': cache.error,
+                'low_power': cache.low_power,
+                'recording_state': cache.recording_state,
             })
         return status
-
-
-class ClientError(Exception):
-    """Custom client error for aiohttp errors."""
-    pass
